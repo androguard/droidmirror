@@ -1,0 +1,12 @@
+[package]
+name = "droidmirror-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Wire format for droidmirror (wasm-clean, no I/O)"
+
+[dependencies]
+byteorder = { workspace = true }
+thiserror = { workspace = true }

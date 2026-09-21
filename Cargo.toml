@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/client",
+    "crates/transport",
+    "crates/server",
+    "crates/native",
+    "crates/web",
+]
+# `droidmirror-web` is wasm-bindgen and is built with scripts/build-web.sh.
+default-members = [
+    "crates/proto",
+    "crates/client",
+    "crates/transport",
+    "crates/server",
+    "crates/native",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.81"
+authors = ["androguard"]
+
+[workspace.dependencies]
+droidmirror-proto = { path = "crates/proto" }
+droidmirror-client = { path = "crates/client" }
+droidmirror-transport = { path = "crates/transport" }
+byteorder = "1"
+thiserror = "2"
+log = "0.4"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+async-trait = "0.1"

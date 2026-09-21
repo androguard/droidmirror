@@ -1,0 +1,21 @@
+[package]
+name = "droidmirror-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Transport trait and native ADB (USB via nusb, TCP). Protocol core follows webadb-rs."
+
+[dependencies]
+thiserror = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+nusb = "0.1.14"
+rsa = { version = "0.9", features = ["sha1", "pem"] }
+sha1 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true }

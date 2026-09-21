@@ -1,0 +1,25 @@
+[package]
+name = "droidmirror-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "On-device capture and input server (arm64 Android)"
+
+[lib]
+name = "droidmirror_server"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "droidmirror-server"
+path = "src/main.rs"
+
+[dependencies]
+droidmirror-proto = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+libc = "0.2"

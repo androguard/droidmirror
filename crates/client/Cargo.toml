@@ -1,0 +1,11 @@
+[package]
+name = "droidmirror-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Sans-IO mirror core: demux, control encode, coordinate map"
+
+[dependencies]
+droidmirror-proto = { workspace = true }

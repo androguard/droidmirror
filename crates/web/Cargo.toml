@@ -1,0 +1,23 @@
+[package]
+name = "droidmirror-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "wasm-bindgen wrapper of droidmirror-client"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["wasm-exports"]
+# Off when another wasm crate re-exports this API. Otherwise both crates emit
+# the same `mirrorclient_*` symbols and the link fails.
+wasm-exports = []
+
+[dependencies]
+droidmirror-client = { workspace = true }
+droidmirror-proto = { workspace = true }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
