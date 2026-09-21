@@ -21,6 +21,10 @@ pub struct Gpu {
     view_w: u32,
     view_h: u32,
     toolbar_px: f32,
+    toolbar_tex: wgpu::Texture,
+    toolbar_bind: wgpu::BindGroup,
+    toolbar_vb: wgpu::Buffer,
+    toolbar_sampler: wgpu::Sampler,
 }
 
 #[repr(C)]
@@ -163,6 +167,19 @@ impl Gpu {
             contents: bytemuck::cast_slice(&quad(1.0, 1.0, 1.0, 1.0, toolbar_px, size.height as f32)),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+        let view_h = size.height.max(1) as f32;
+        let toolbar_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let toolbar_tex = blank_texture(&device, 2, 2);
+        let toolbar_bind = make_bind(&device, &bind_group_layout, &toolbar_tex, &toolbar_sampler);
+        let toolbar_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("toolbar"),
+            contents: bytemuck::cast_slice(&toolbar_quad(toolbar_px, view_h)),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
         Ok(Self {
             surface,
             device,
@@ -179,6 +196,10 @@ impl Gpu {
             view_w: size.width.max(1),
             view_h: size.height.max(1),
             toolbar_px,
+            toolbar_tex,
+            toolbar_bind,
+            toolbar_vb,
+            toolbar_sampler,
         })
     }
 
@@ -192,6 +213,40 @@ impl Gpu {
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
         self.update_quad();
+    }
+
+    pub fn upload_toolbar(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        if width == 0 || height == 0 || rgba.len() < (width * height * 4) as usize {
+            return;
+        }
+        if self.toolbar_tex.width() != width || self.toolbar_tex.height() != height {
+            self.toolbar_tex = blank_texture(&self.device, width, height);
+            self.toolbar_bind = make_bind(
+                &self.device,
+                &self.bind_group_layout,
+                &self.toolbar_tex,
+                &self.toolbar_sampler,
+            );
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.toolbar_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     pub fn upload(&mut self, width: u32, height: u32, rgba: &[u8]) {
@@ -261,6 +316,9 @@ impl Gpu {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
             pass.draw(0..4, 0..1);
+            pass.set_bind_group(0, &self.toolbar_bind, &[]);
+            pass.set_vertex_buffer(0, self.toolbar_vb.slice(..));
+            pass.draw(0..4, 0..1);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
@@ -277,7 +335,19 @@ impl Gpu {
             self.view_h as f32,
         );
         self.queue.write_buffer(&self.vertex_buf, 0, bytemuck::cast_slice(&verts));
+        let bar = toolbar_quad(self.toolbar_px, self.view_h as f32);
+        self.queue.write_buffer(&self.toolbar_vb, 0, bytemuck::cast_slice(&bar));
     }
+}
+
+fn toolbar_quad(toolbar_px: f32, full_h: f32) -> [Vert; 4] {
+    let top = -1.0 + 2.0 * (toolbar_px / full_h.max(1.0));
+    [
+        Vert { pos: [-1.0, -1.0], uv: [0.0, 1.0] },
+        Vert { pos: [-1.0, top], uv: [0.0, 0.0] },
+        Vert { pos: [1.0, -1.0], uv: [1.0, 1.0] },
+        Vert { pos: [1.0, top], uv: [1.0, 0.0] },
+    ]
 }
 
 fn blank_texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {

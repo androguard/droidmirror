@@ -77,6 +77,9 @@ impl Capture {
         put_int(env, &format, "frame-rate", fps.max(1) as i32)?;
         put_int(env, &format, "i-frame-interval", 1)?;
         put_int(env, &format, "bitrate-mode", 1)?; // VBR
+        // Repeat SPS/PPS on every IDR so a decoder that missed the handshake
+        // (or dropped a frame) can resync. Ignored by encoders that don't know the key.
+        let _ = put_int(env, &format, "prepend-sps-pps-to-idr-frames", 1);
 
         call_void(
             env,

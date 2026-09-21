@@ -1,10 +1,13 @@
+mod capture;
 mod decode;
 mod render;
+mod toolbar;
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
@@ -23,7 +26,8 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const REMOTE_DIR: &str = "/data/local/tmp/droidmirror";
-const TOOLBAR_DP: f64 = 48.0;
+/// Two rows: capture (PNG, GIF, MP4) and navigation.
+const TOOLBAR_DP: f64 = 80.0;
 
 #[derive(Parser, Debug)]
 #[command(name = "droidmirror", about = "Android screen mirror (full Rust)")]
@@ -83,12 +87,15 @@ enum HostCmd {
         v: f32,
     },
     Pause(bool),
+    /// Start or stop muxing the mirror's H.264 into an MP4 on the Desktop.
+    RecordMp4(bool),
     Quit,
 }
 
 enum DecodedMsg {
     Frame(decode::RgbaFrame),
     Size(u16, u16),
+    Status(String),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -98,11 +105,19 @@ fn main() -> anyhow::Result<()> {
     if args.dump_nals.is_some() {
         return rt.block_on(run_dump(args));
     }
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedMsg>(2);
-    let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel::<HostCmd>();
     let args2 = ArgsSnapshot::from(&args);
-    rt.spawn(async move {
-        if let Err(e) = session(args2, frame_tx, cmd_rx).await {
+    let live = match rt.block_on(prepare(&args2)) {
+        Ok(live) => live,
+        Err(e) => {
+            log::error!("{e:#}");
+            drop(rt);
+            std::process::exit(1);
+        }
+    };
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedMsg>(8);
+    let (cmd_tx, cmd_rx) = async_mpsc::unbounded_channel::<HostCmd>();
+    let session_task = rt.spawn(async move {
+        if let Err(e) = session(live, args2, frame_tx, cmd_rx).await {
             log::error!("{e:#}");
         }
     });
@@ -118,8 +133,18 @@ fn main() -> anyhow::Result<()> {
         video: (0, 0),
         no_control: args.no_control,
         toolbar_px: TOOLBAR_DP as f32,
+        latest: None,
+        gif: None,
+        gif_last: None,
+        mp4_on: false,
+        status: String::new(),
     };
     event_loop.run_app(&mut app)?;
+    rt.block_on(async {
+        if tokio::time::timeout(Duration::from_secs(3), session_task).await.is_err() {
+            log::warn!("mirror session did not exit");
+        }
+    });
     Ok(())
 }
 
@@ -162,6 +187,16 @@ struct App {
     video: (u16, u16),
     no_control: bool,
     toolbar_px: f32,
+    latest: Option<decode::RgbaFrame>,
+    gif: Option<GifRec>,
+    gif_last: Option<Instant>,
+    mp4_on: bool,
+    status: String,
+}
+
+struct GifRec {
+    tx: SyncSender<capture::GifFrame>,
+    join: Option<JoinHandle<()>>,
 }
 
 impl ApplicationHandler for App {
@@ -170,8 +205,8 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("droidmirror  ·  bottom bar: Back Home Recents Power Vol- Vol+  ·  Esc back")
-            .with_inner_size(LogicalSize::new(420.0, 860.0));
+            .with_title("droidmirror")
+            .with_inner_size(LogicalSize::new(420.0, 900.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
         let scale = window.scale_factor() as f32;
         self.toolbar_px = (TOOLBAR_DP as f32) * scale;
@@ -180,11 +215,15 @@ impl ApplicationHandler for App {
             Err(e) => log::error!("gpu: {e:#}"),
         }
         self.window = Some(window);
+        self.paint_bar();
+        self.refresh_title();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                self.stop_gif();
+                let _ = self.cmd_tx.send(HostCmd::RecordMp4(false));
                 let _ = self.cmd_tx.send(HostCmd::Quit);
                 event_loop.exit();
             }
@@ -192,6 +231,7 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
+                self.paint_bar();
             }
             WindowEvent::RedrawRequested => {
                 while let Ok(msg) = self.frame_rx.try_recv() {
@@ -199,9 +239,19 @@ impl ApplicationHandler for App {
                         DecodedMsg::Size(w, h) => self.video = (w, h),
                         DecodedMsg::Frame(frame) => {
                             self.video = (frame.width as u16, frame.height as u16);
+                            self.push_gif(&frame);
                             if let Some(gpu) = &mut self.gpu {
                                 gpu.upload(frame.width, frame.height, &frame.rgba);
                             }
+                            self.latest = Some(frame);
+                        }
+                        DecodedMsg::Status(text) => {
+                            if text.starts_with("mp4:") {
+                                self.mp4_on = false;
+                                self.paint_bar();
+                            }
+                            self.status = text;
+                            self.refresh_title();
                         }
                     }
                 }
@@ -268,6 +318,9 @@ impl ApplicationHandler for App {
                 });
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed && !event.repeat && self.capture_shortcut(&event) {
+                    return;
+                }
                 if event.state != ElementState::Pressed || self.no_control {
                     if event.state == ElementState::Released {
                         if let Some(code) = android_key(&event.physical_key) {
@@ -309,11 +362,21 @@ impl App {
         self.cursor.1 >= w.inner_size().height as f32 - self.toolbar_px
     }
 
-    fn toolbar_click(&self) {
-        let Some(w) = &self.window else {
+    fn toolbar_click(&mut self) {
+        let Some(window) = &self.window else {
             return;
         };
-        let width = w.inner_size().width as f32;
+        let width = window.inner_size().width as f32;
+        let top = window.inner_size().height as f32 - self.toolbar_px;
+        if self.cursor.1 < top + self.toolbar_px / 2.0 {
+            let slot = ((self.cursor.0 / width) * 3.0).clamp(0.0, 2.99) as u32;
+            match slot {
+                0 => self.screenshot(),
+                1 => self.toggle_gif(),
+                _ => self.toggle_mp4(),
+            }
+            return;
+        }
         let slot = ((self.cursor.0 / width) * 6.0).clamp(0.0, 5.0) as u32;
         let key = match slot {
             0 => KEY_BACK,
@@ -331,6 +394,150 @@ impl App {
             keycode: key,
             action: KeyAction::Up,
         });
+    }
+
+    fn capture_shortcut(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if !(self.mods.super_key() || self.mods.control_key()) || !self.mods.shift_key() {
+            return false;
+        }
+        let Key::Character(text) = &event.logical_key else {
+            return false;
+        };
+        match text.chars().next().map(|c| c.to_ascii_lowercase()) {
+            Some('s') => self.screenshot(),
+            Some('g') => self.toggle_gif(),
+            Some('m') => self.toggle_mp4(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn screenshot(&mut self) {
+        let Some(frame) = &self.latest else {
+            log::warn!("screenshot: no frame yet");
+            return;
+        };
+        let path = capture::output_path("png");
+        let width = frame.width;
+        let height = frame.height;
+        let rgba = frame.rgba.clone();
+        self.status = path.display().to_string();
+        self.refresh_title();
+        std::thread::spawn(move || match capture::save_png(&path, width, height, &rgba) {
+            Ok(()) => log::info!("saved {}", path.display()),
+            Err(e) => log::error!("screenshot: {e:#}"),
+        });
+    }
+
+    fn toggle_gif(&mut self) {
+        if self.gif.is_some() {
+            self.stop_gif();
+            return;
+        }
+        if self.latest.is_none() {
+            log::warn!("gif: no frame yet");
+            return;
+        }
+        let path = capture::output_path("gif");
+        let (tx, join) = capture::spawn_gif(path.clone());
+        self.gif = Some(GifRec {
+            tx,
+            join: Some(join),
+        });
+        self.gif_last = None;
+        self.status = path.display().to_string();
+        self.paint_bar();
+        self.refresh_title();
+        log::info!("recording {}", path.display());
+    }
+
+    fn stop_gif(&mut self) {
+        let Some(gif) = self.gif.take() else {
+            return;
+        };
+        drop(gif.tx);
+        if let Some(join) = gif.join {
+            let _ = join.join();
+        }
+        self.gif_last = None;
+        self.paint_bar();
+        self.refresh_title();
+    }
+
+    fn push_gif(&mut self, frame: &decode::RgbaFrame) {
+        let Some(gif) = &self.gif else {
+            return;
+        };
+        let now = Instant::now();
+        let delay_cs = self
+            .gif_last
+            .map(|t| (now.duration_since(t).as_millis() / 10) as u16)
+            .unwrap_or(10);
+        if self.gif_last.is_some() && delay_cs < 9 {
+            return;
+        }
+        let (width, height, rgba) = capture::fit_max_edge(frame.width, frame.height, &frame.rgba, 480);
+        if gif
+            .tx
+            .try_send(capture::GifFrame {
+                width,
+                height,
+                rgba,
+                delay_cs: delay_cs.max(2),
+            })
+            .is_ok()
+        {
+            self.gif_last = Some(now);
+        }
+    }
+
+    fn toggle_mp4(&mut self) {
+        self.mp4_on = !self.mp4_on;
+        let _ = self.cmd_tx.send(HostCmd::RecordMp4(self.mp4_on));
+        if self.mp4_on {
+            self.status.clear();
+        }
+        self.paint_bar();
+        self.refresh_title();
+    }
+
+    fn paint_bar(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let height = self.toolbar_px.round().max(2.0) as u32;
+        let px = toolbar::paint(
+            size.width.max(1),
+            height,
+            toolbar::ToolbarState {
+                gif: self.gif.is_some(),
+                mp4: self.mp4_on,
+            },
+        );
+        if let Some(gpu) = &mut self.gpu {
+            gpu.upload_toolbar(size.width.max(1), height, &px);
+        }
+    }
+
+    fn refresh_title(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let rec = match (self.gif.is_some(), self.mp4_on) {
+            (true, true) => "recording GIF+MP4 · ",
+            (true, false) => "recording GIF · ",
+            (false, true) => "recording MP4 · ",
+            (false, false) => "",
+        };
+        let saved = if rec.is_empty() && !self.status.is_empty() {
+            format!("{} · ", self.status)
+        } else {
+            String::new()
+        };
+        window.set_title(&format!(
+            "droidmirror  ·  {rec}{saved}PNG  GIF  MP4  ·  Back Home Apps Power Vol- Vol+"
+        ));
     }
 
     fn send_touch(&self, action: TouchAction) {
@@ -473,18 +680,23 @@ fn android_key(key: &PhysicalKey) -> Option<u32> {
 }
 
 async fn run_dump(args: Args) -> anyhow::Result<()> {
-    session(ArgsSnapshot::from(&args), mpsc::sync_channel(8).0, async_mpsc::unbounded_channel().1).await
+    let snap = ArgsSnapshot::from(&args);
+    let live = prepare(&snap).await?;
+    session(live, snap, mpsc::sync_channel(8).0, async_mpsc::unbounded_channel().1).await
 }
 
-async fn session(
-    args: ArgsSnapshot,
-    frame_tx: SyncSender<DecodedMsg>,
-    mut cmd_rx: async_mpsc::UnboundedReceiver<HostCmd>,
-) -> anyhow::Result<()> {
-    let adb = Arc::new(connect(&args).await?);
+struct Live {
+    adb: Arc<NativeAdb>,
+    video: StreamId,
+}
+
+/// Connect, push the server, and open the mirror socket. Failure here exits
+/// before the window is created.
+async fn prepare(args: &ArgsSnapshot) -> anyhow::Result<Live> {
+    let adb = Arc::new(connect(args).await?);
     log::info!("adb {}", adb.banner());
-    deploy(&adb, &args).await?;
-    let launch = launch_command(&args);
+    deploy(&adb, args).await?;
+    let launch = launch_command(args);
     log::info!("launch {launch}");
     let shell = adb.open(&format!("shell:{launch}")).await?;
     let log_adb = Arc::clone(&adb);
@@ -498,44 +710,100 @@ async fn session(
         }
     });
     let video = open_retry(&adb, "localabstract:droidmirror", 40).await?;
+    Ok(Live { adb, video })
+}
+
+async fn session(
+    live: Live,
+    args: ArgsSnapshot,
+    frame_tx: SyncSender<DecodedMsg>,
+    mut cmd_rx: async_mpsc::UnboundedReceiver<HostCmd>,
+) -> anyhow::Result<()> {
+    let Live { adb, video } = live;
     let mut client = Client::new();
     let mut record = if let Some(path) = args.record.as_ref().or(args.dump_nals.as_ref()) {
         Some(std::fs::File::create(path).with_context(|| format!("record {}", path.display()))?)
     } else {
         None
     };
-    let (nal_tx, nal_rx) = mpsc::sync_channel::<NalJob>(2);
+    let (nal_tx, nal_rx) = mpsc::sync_channel::<NalJob>(8);
     if args.dump_nals.is_none() {
         let frame_tx2 = frame_tx.clone();
         std::thread::spawn(move || decode_thread(nal_rx, frame_tx2));
     }
+    let mut video_cfg: Option<VideoCfg> = None;
+    let mut mp4: Option<capture::Mp4Rec> = None;
+    let mut mp4_on = false;
+    let mut stream_err = None;
     loop {
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
-                if matches!(cmd, HostCmd::Quit) {
-                    break;
-                }
-                let bytes = encode_cmd(&client, cmd);
-                if !bytes.is_empty() {
-                    adb.write_stream(video, &bytes).await?;
+                match cmd {
+                    HostCmd::Quit => break,
+                    HostCmd::RecordMp4(on) => {
+                        mp4_on = on;
+                        if on {
+                            if mp4.is_none() {
+                                if let Some(cfg) = &video_cfg {
+                                    mp4 = open_mp4(cfg, &frame_tx);
+                                    if mp4.is_none() {
+                                        mp4_on = false;
+                                    }
+                                } else {
+                                    log::info!("mp4: waiting for video");
+                                }
+                            }
+                        } else {
+                            finish_mp4(&mut mp4, &frame_tx);
+                        }
+                    }
+                    other => {
+                        let bytes = encode_cmd(&client, other);
+                        if !bytes.is_empty() {
+                            adb.write_stream(video, &bytes).await?;
+                        }
+                    }
                 }
             }
             chunk = adb.read_stream(video) => {
                 let chunk = chunk?;
                 if chunk.is_empty() {
-                    anyhow::bail!("mirror stream closed");
+                    stream_err = Some(anyhow::anyhow!("mirror stream closed"));
+                    break;
                 }
                 for ev in client.on_bytes(&chunk) {
                     match ev {
                         Out::DeviceName(n) => log::info!("device {n}"),
                         Out::Configure { codec, csd, width, height } => {
                             log::info!("configure {codec:?} {width}x{height} csd {}", csd.len());
+                            let changed = video_cfg.as_ref().is_some_and(|c| {
+                                c.width != width || c.height != height || c.codec != codec
+                            });
+                            if changed {
+                                finish_mp4(&mut mp4, &frame_tx);
+                            }
+                            video_cfg = Some(VideoCfg {
+                                codec,
+                                csd: csd.clone(),
+                                width,
+                                height,
+                            });
+                            if mp4_on && mp4.is_none() {
+                                mp4 = open_mp4(video_cfg.as_ref().unwrap(), &frame_tx);
+                                if mp4.is_none() {
+                                    mp4_on = false;
+                                }
+                            }
                             let _ = frame_tx.try_send(DecodedMsg::Size(width, height));
-                            let _ = nal_tx.try_send(NalJob::Configure { codec, csd });
+                            enqueue(
+                                &nal_tx,
+                                NalJob::Configure { codec, csd },
+                                true,
+                            );
                         }
-                        Out::Frame { nal, keyframe, .. } => {
+                        Out::Frame { nal, keyframe, pts_us } => {
                             if let Some(f) = &mut record {
                                 use std::io::Write;
                                 if !nal.starts_with(&[0, 0, 0, 1]) && !nal.starts_with(&[0, 0, 1]) {
@@ -543,12 +811,16 @@ async fn session(
                                 }
                                 let _ = f.write_all(&nal);
                             }
+                            if let Some(rec) = &mut mp4 {
+                                if let Err(e) = rec.push(pts_us, keyframe, &nal) {
+                                    log::error!("mp4: {e:#}");
+                                }
+                            }
                             if args.dump_nals.is_some() {
                                 continue;
                             }
-                            if nal_tx.try_send(NalJob::Frame(nal)).is_err() {
+                            if !enqueue(&nal_tx, NalJob::Frame { nal, keyframe }, keyframe) {
                                 client.request_keyframe_skip();
-                                let _ = keyframe;
                             }
                         }
                         Out::Error(e) => log::error!("protocol: {e}"),
@@ -557,13 +829,73 @@ async fn session(
             }
         }
     }
+    finish_mp4(&mut mp4, &frame_tx);
     let _ = adb.close_stream(video).await;
+    if let Some(e) = stream_err {
+        return Err(e);
+    }
     Ok(())
+}
+
+struct VideoCfg {
+    codec: Codec,
+    csd: Vec<u8>,
+    width: u16,
+    height: u16,
+}
+
+fn open_mp4(cfg: &VideoCfg, frame_tx: &SyncSender<DecodedMsg>) -> Option<capture::Mp4Rec> {
+    if cfg.codec != Codec::H264 {
+        let msg = "mp4: capture needs H.264".to_string();
+        log::error!("{msg}");
+        let _ = frame_tx.try_send(DecodedMsg::Status(msg));
+        return None;
+    }
+    let path = capture::output_path("mp4");
+    match capture::Mp4Rec::start(path, cfg.width, cfg.height, &cfg.csd) {
+        Ok(rec) => {
+            log::info!("recording {}", rec.path().display());
+            Some(rec)
+        }
+        Err(e) => {
+            let msg = format!("mp4: {e:#}");
+            log::error!("{msg}");
+            let _ = frame_tx.try_send(DecodedMsg::Status(msg));
+            None
+        }
+    }
+}
+
+fn finish_mp4(mp4: &mut Option<capture::Mp4Rec>, frame_tx: &SyncSender<DecodedMsg>) {
+    let Some(rec) = mp4.take() else {
+        return;
+    };
+    match rec.finish() {
+        Ok(path) => {
+            log::info!("saved {}", path.display());
+            let _ = frame_tx.try_send(DecodedMsg::Status(path.display().to_string()));
+        }
+        Err(e) => {
+            let msg = format!("mp4: {e:#}");
+            log::error!("{msg}");
+            let _ = frame_tx.try_send(DecodedMsg::Status(msg));
+        }
+    }
 }
 
 enum NalJob {
     Configure { codec: Codec, csd: Vec<u8> },
-    Frame(Vec<u8>),
+    Frame { nal: Vec<u8>, keyframe: bool },
+}
+
+/// Queue a NAL for the decoder. Codec config and IDRs wait briefly instead of
+/// being dropped: OpenH264 cannot resync without them.
+fn enqueue(tx: &SyncSender<NalJob>, job: NalJob, important: bool) -> bool {
+    match tx.try_send(job) {
+        Ok(()) => true,
+        Err(TrySendError::Full(job)) if important => tx.send(job).is_ok(),
+        Err(_) => false,
+    }
 }
 
 fn decode_thread(rx: Receiver<NalJob>, tx: SyncSender<DecodedMsg>) {
@@ -575,7 +907,7 @@ fn decode_thread(rx: Receiver<NalJob>, tx: SyncSender<DecodedMsg>) {
                     log::error!("decoder configure: {e:#}");
                 }
             }
-            NalJob::Frame(nal) => match dec.decode(&nal) {
+            NalJob::Frame { nal, keyframe } => match dec.decode(&nal, keyframe) {
                 Ok(Some(frame)) => {
                     if tx.send(DecodedMsg::Frame(frame)).is_err() {
                         break;
@@ -613,7 +945,7 @@ fn encode_cmd(client: &Client, cmd: HostCmd) -> Vec<u8> {
             v,
         } => client.scroll(x, y, view_w, view_h, h, v),
         HostCmd::Pause(on) => client.pause(on),
-        HostCmd::Quit => Vec::new(),
+        HostCmd::RecordMp4(_) | HostCmd::Quit => Vec::new(),
     }
 }
 

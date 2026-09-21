@@ -1,6 +1,7 @@
 mod capture;
 mod inject_sdk;
 mod net;
+mod power;
 mod run;
 mod uinput;
 

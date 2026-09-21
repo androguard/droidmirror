@@ -9,6 +9,7 @@ use super::capture::{display_info, Capture, DisplayInfo};
 use super::inject_sdk::SdkInject;
 use super::log_line;
 use super::net::{self, Listener};
+use super::power::StayAwake;
 use super::uinput::{ShellInput, UInput};
 use crate::control::{fit_max_size, parse_server_args, ControlDemux, Inject, ServerConfig};
 
@@ -44,6 +45,13 @@ fn java_args(env: &mut JNIEnv, args: JObject) -> Vec<String> {
 }
 
 fn serve(env: &mut JNIEnv, cfg: &ServerConfig) -> Result<(), String> {
+    let stay = StayAwake::acquire(env);
+    let result = serve_session(env, cfg);
+    stay.release(env);
+    result
+}
+
+fn serve_session(env: &mut JNIEnv, cfg: &ServerConfig) -> Result<(), String> {
     let info = display_info(env).unwrap_or_else(|e| {
         log_line(&format!("display query failed ({e}); using 1080x1920"));
         DisplayInfo {

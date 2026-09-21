@@ -30,3 +30,7 @@ winit = "0.30"
 pollster = "0.4"
 arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+gif = "0.13"
+mp4 = "0.14"
+bytes = "1"
